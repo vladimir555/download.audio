@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-
 import os
 import argparse
 import yt_dlp
+import sys
 from mutagen.mp4 import MP4, MP4Cover
 
 def get_uploader(info):
@@ -48,8 +48,8 @@ def set_metadata(filepath, info, source):
     except Exception as e:
         print(f"   ⚠️  Не удалось установить метаданные: {e}")
 
-def download_audio(url, output_path):
-    """Скачивает ТОЛЬКО аудио без видео с гибкой обработкой форматов"""
+def download_audio(url, output_path, use_cookies=False, use_proxy=False):
+    """Скачивает аудио с автоматическим выбором лучшего потока"""
     # Определяем источник
     if 'youtube.com' in url or 'youtu.be' in url:
         source = 'youtube'
@@ -59,41 +59,49 @@ def download_audio(url, output_path):
         source = 'audio'
 
     ydl_opts = {
-        # Гибкий выбор формата: лучший аудио-только поток, или аудио из видео
-        'format': 'bestaudio[acodec!=none]/bestaudio/best',
-        'outtmpl': os.path.join(output_path, f'{source} %(title)s.%(ext)s'),
+        # Наилучший аудио-поток с резервным вариантом из видео
+        'format': 'bestaudio/best',
+        'outtmpl': os.path.join(output_path, f'{source}_%(title)s.%(ext)s'),
         'writethumbnail': True,
         'quiet': False,
         'no_warnings': True,
-        # Конвертируем в m4a после загрузки (гарантируем нужный формат)
+        'retries': 10,
+        'fragment_retries': 10,
+        'extractor_retries': 10,
+        'socket_timeout': 30,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'm4a',
-            'preferredquality': '0',  # 0 = без потерь качества (копирование)
+            'preferredquality': '192',  # Оптимальное качество
         }, {
             'key': 'FFmpegMetadata',
             'add_metadata': True,
         }],
-        # Отключаем строгую фильтрацию видео — yt-dlp сам извлечет аудио
-        'format_sort': [],
     }
+
+    # Добавляем куки если нужно
+    if use_cookies:
+        ydl_opts['cookiesfrombrowser'] = ('firefox',)
+        print("🍪 Используем cookies из Firefox для обхода защиты")
+
+    # Добавляем прокси если нужно
+    if use_proxy:
+        ydl_opts['proxy'] = 'socks5://127.0.0.1:9050'
+        print("🔌 Используем SOCKS5 прокси 127.0.0.1:9050")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        # После конвертации в m4a файл будет с расширением .m4a
-        base = os.path.join(output_path, f"{source} {info['title']}")
+        base = os.path.join(output_path, f"{source}_{info['title']}")
         filename = base + '.m4a'
 
-        # Устанавливаем кастомные метаданные (перезаписываем стандартные)
+        # Устанавливаем метаданные
         if os.path.exists(filename):
             set_metadata(filename, info, source)
         else:
-            # Иногда yt-dlp оставляет оригинальное расширение перед конвертацией
-            for ext in ['.m4a', '.mp4', '.webm', '.opus']:
+            for ext in ['.m4a', '.mp3', '.opus']:
                 candidate = base + ext
                 if os.path.exists(candidate):
                     if ext != '.m4a':
-                        # Переименовываем в .m4a
                         new_name = base + '.m4a'
                         os.rename(candidate, new_name)
                         filename = new_name
@@ -103,10 +111,14 @@ def download_audio(url, output_path):
         return filename
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Скачивание ТОЛЬКО аудио без видео')
+    parser = argparse.ArgumentParser(description='Скачивание аудио с автоматическим обходом ограничений')
     parser.add_argument('url', type=str, help='URL видео')
     parser.add_argument('--output', '-o', type=str, default='downloads',
                         help='Папка для сохранения файлов (по умолчанию: downloads)')
+    parser.add_argument('--cookies', action='store_true',
+                        help='Принудительно использовать cookies из Firefox')
+    parser.add_argument('--proxy', action='store_true',
+                        help='Принудительно использовать SOCKS5 прокси 127.0.0.1:9050')
 
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
@@ -117,32 +129,43 @@ if __name__ == "__main__":
     except ImportError:
         print("❌ Требуется библиотека mutagen")
         print("   Установите: pip install mutagen")
-        exit(1)
+        sys.exit(1)
 
-    # Проверка FFmpeg (обязателен для конвертации в m4a)
     import shutil
     if not shutil.which('ffmpeg'):
-        print("❌ Требуется FFmpeg для конвертации аудио")
-        print("   Установите: brew install ffmpeg  # macOS")
-        print("   Или: sudo apt install ffmpeg    # Linux")
-        exit(1)
+        print("❌ Требуется FFmpeg")
+        print("   Установите: brew install ffmpeg")
+        sys.exit(1)
 
     try:
         print(f"Обработка: {args.url}")
-        audio_file = download_audio(args.url, args.output)
-        print(f"\n✅ Аудио сохранено (ТОЛЬКО звук): {os.path.basename(audio_file)}")
-        print(f"   Путь: {audio_file}")
-
-    except yt_dlp.utils.DownloadError as e:
-        if 'format is not available' in str(e).lower():
-            print("\n⚠️  Формат не найден. Доступные форматы:")
-            # Показываем доступные форматы
-            ydl_opts = {'listformats': True, 'quiet': False}
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([args.url])
+        # Первая попытка без куков и прокси
+        if not args.cookies and not args.proxy:
+            try:
+                audio_file = download_audio(args.url, args.output, use_cookies=False, use_proxy=False)
+            except Exception as e:
+                error_msg = str(e).lower()
+                # Обнаружение ошибок защиты от ботов
+                if 'sign in to confirm' in error_msg or 'bot' in error_msg or 'captcha' in error_msg:
+                    print("\n⚠️  Обнаружена защита от ботов. Повторная попытка с cookies из Firefox...")
+                    audio_file = download_audio(args.url, args.output, use_cookies=True, use_proxy=False)
+                # Обнаружение сетевых ошибок
+                elif 'timeout' in error_msg or 'connection' in error_msg or 'unable to connect' in error_msg:
+                    print("\n⚠️  Сетевая ошибка. Повторная попытка через SOCKS5 прокси...")
+                    audio_file = download_audio(args.url, args.output, use_cookies=False, use_proxy=True)
+                else:
+                    raise
         else:
-            print(f"\n❌ Ошибка: {str(e)}")
-        exit(1)
+            # Принудительное использование опций
+            audio_file = download_audio(
+                args.url,
+                args.output,
+                use_cookies=args.cookies,
+                use_proxy=args.proxy
+            )
+
+        print(f"\n✅ Аудио сохранено: {os.path.basename(audio_file)}")
+
     except Exception as e:
         print(f"\n❌ Ошибка: {str(e)}")
-        exit(1)
+        sys.exit(1)
