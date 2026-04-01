@@ -3,31 +3,36 @@ import os
 import argparse
 import yt_dlp
 import sys
-from mutagen.mp4 import MP4, MP4Cover
+import time
+import ssl
+import shutil
+
+def print_ssl_info():
+    print(f"🐍 Python: {sys.version.split()[0]}")
+    print(f"🔒 OpenSSL: {ssl.OPENSSL_VERSION}")
+    print()
 
 def get_uploader(info):
-    """Получает название канала/автора"""
     for key in ['uploader', 'channel', 'uploader_name', 'artist']:
         if info.get(key):
             return info[key]
     return 'Unknown'
 
 def set_metadata(filepath, info, source):
-    """Устанавливает кастомные метаданные в m4a файл"""
     try:
+        from mutagen.mp4 import MP4, MP4Cover
         audio = MP4(filepath)
         uploader = get_uploader(info)
         title = info.get('title', 'Unknown')
 
-        audio['\xa9ART'] = [source]                      # Исполнитель
-        audio['\xa9alb'] = [uploader]                    # Альбом
-        audio['\xa9nam'] = [f"{uploader} - {title}"]     # Название
+        audio['\xa9ART'] = [source]
+        audio['\xa9alb'] = [uploader]
+        audio['\xa9nam'] = [f"{uploader} - {title}"]
 
         if info.get('upload_date'):
             year = info['upload_date'][:4]
             audio['\xa9day'] = [year]
 
-        # Встраиваем обложку
         base = os.path.splitext(filepath)[0]
         for ext in ['.jpg', '.jpeg', '.webp', '.png']:
             thumb_path = base + ext
@@ -40,17 +45,14 @@ def set_metadata(filepath, info, source):
                 break
 
         audio.save()
-        print(f"   Метаданные установлены:")
-        print(f"     • Исполнитель: {source}")
-        print(f"     • Альбом: {uploader}")
-        print(f"     • Название: {uploader} - {title}")
-
+        print(f"   ✅ Метаданные установлены:")
+        print(f"      • Исполнитель: {source}")
+        print(f"      • Альбом: {uploader}")
+        print(f"      • Название: {uploader} - {title}")
     except Exception as e:
-        print(f"   ⚠️  Не удалось установить метаданные: {e}")
+        print(f"   ⚠️  Ошибка метаданных: {e}")
 
-def download_audio(url, output_path, use_cookies=False, use_proxy=False):
-    """Скачивает аудио с автоматическим выбором лучшего потока"""
-    # Определяем источник
+def download_audio(url, output_path, use_tor=False, debug=False):
     if 'youtube.com' in url or 'youtu.be' in url:
         source = 'youtube'
     elif 'rutube.ru' in url:
@@ -58,46 +60,54 @@ def download_audio(url, output_path, use_cookies=False, use_proxy=False):
     else:
         source = 'audio'
 
+    # 🔑 Оптимальные настройки для музыки (БЕЗ прокси):
     ydl_opts = {
-        # Наилучший аудио-поток с резервным вариантом из видео
-        'format': 'bestaudio/best',
+        # Формат 18 (360p mp4) — надёжный выбор для музыки
+        'format': '18/best[ext=mp4]/best',
         'outtmpl': os.path.join(output_path, f'{source}_%(title)s.%(ext)s'),
         'writethumbnail': True,
         'quiet': False,
-        'no_warnings': True,
-        'retries': 10,
-        'fragment_retries': 10,
-        'extractor_retries': 10,
-        'socket_timeout': 30,
+        'no_warnings': False,
+        'retries': 3,
+        'fragment_retries': 3,
+        'socket_timeout': 10,
+        'sleep_interval': 1,
+        'extractor_args': {
+            'youtube': {
+                # web_safari предоставляет стабильные потоки без PO Token
+                'player_client': ['web_safari', 'web'],
+                'player_skip': [],
+            }
+        },
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'm4a',
-            'preferredquality': '192',  # Оптимальное качество
+            'preferredquality': '192',
         }, {
             'key': 'FFmpegMetadata',
             'add_metadata': True,
         }],
+        # 🔑 Исправление ошибки с remote_components:
+        'remote_components': 'ejs:github',  # СТРОКА, а не словарь!
     }
 
-    # Добавляем куки если нужно
-    if use_cookies:
-        ydl_opts['cookiesfrombrowser'] = ('firefox',)
-        print("🍪 Используем cookies из Firefox для обхода защиты")
+    if debug:
+        ydl_opts['verbose'] = True
 
-    # Добавляем прокси если нужно
-    if use_proxy:
+    ydl_opts['cookiesfrombrowser'] = ('firefox',)
+    print("   🍪 Используем куки из Firefox")
+
+    if use_tor:
         ydl_opts['proxy'] = 'socks5://127.0.0.1:9050'
-        print("🔌 Используем SOCKS5 прокси 127.0.0.1:9050")
+        print("   ⚠️  ВНИМАНИЕ: прокси часто блокирует музыку из-за региональных ограничений")
+        print("   🔌 Используем Tor (SOCKS5 127.0.0.1:9050)")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         base = os.path.join(output_path, f"{source}_{info['title']}")
         filename = base + '.m4a'
 
-        # Устанавливаем метаданные
-        if os.path.exists(filename):
-            set_metadata(filename, info, source)
-        else:
+        if not os.path.exists(filename):
             for ext in ['.m4a', '.mp3', '.opus']:
                 candidate = base + ext
                 if os.path.exists(candidate):
@@ -105,20 +115,23 @@ def download_audio(url, output_path, use_cookies=False, use_proxy=False):
                         new_name = base + '.m4a'
                         os.rename(candidate, new_name)
                         filename = new_name
-                    set_metadata(filename, info, source)
                     break
 
+        if os.path.exists(filename):
+            set_metadata(filename, info, source)
         return filename
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Скачивание аудио с автоматическим обходом ограничений')
+    print_ssl_info()
+
+    parser = argparse.ArgumentParser(description='Скачивание аудио (музыкальные клипы БЕЗ прокси)')
     parser.add_argument('url', type=str, help='URL видео')
     parser.add_argument('--output', '-o', type=str, default='downloads',
                         help='Папка для сохранения файлов (по умолчанию: downloads)')
-    parser.add_argument('--cookies', action='store_true',
-                        help='Принудительно использовать cookies из Firefox')
-    parser.add_argument('--proxy', action='store_true',
-                        help='Принудительно использовать SOCKS5 прокси 127.0.0.1:9050')
+    parser.add_argument('--tor', action='store_true',
+                        help='Использовать Tor прокси (НЕ рекомендуется для музыки!)')
+    parser.add_argument('--debug', action='store_true',
+                        help='Включить подробный отладочный вывод')
 
     args = parser.parse_args()
     os.makedirs(args.output, exist_ok=True)
@@ -127,45 +140,46 @@ if __name__ == "__main__":
     try:
         from mutagen.mp4 import MP4
     except ImportError:
-        print("❌ Требуется библиотека mutagen")
-        print("   Установите: pip install mutagen")
+        print("❌ Установите зависимости: pip install mutagen")
         sys.exit(1)
 
-    import shutil
     if not shutil.which('ffmpeg'):
-        print("❌ Требуется FFmpeg")
-        print("   Установите: brew install ffmpeg")
+        print("❌ Установите FFmpeg: brew install ffmpeg")
         sys.exit(1)
 
-    try:
-        print(f"Обработка: {args.url}")
-        # Первая попытка без куков и прокси
-        if not args.cookies and not args.proxy:
-            try:
-                audio_file = download_audio(args.url, args.output, use_cookies=False, use_proxy=False)
-            except Exception as e:
-                error_msg = str(e).lower()
-                # Обнаружение ошибок защиты от ботов
-                if 'sign in to confirm' in error_msg or 'bot' in error_msg or 'captcha' in error_msg:
-                    print("\n⚠️  Обнаружена защита от ботов. Повторная попытка с cookies из Firefox...")
-                    audio_file = download_audio(args.url, args.output, use_cookies=True, use_proxy=False)
-                # Обнаружение сетевых ошибок
-                elif 'timeout' in error_msg or 'connection' in error_msg or 'unable to connect' in error_msg:
-                    print("\n⚠️  Сетевая ошибка. Повторная попытка через SOCKS5 прокси...")
-                    audio_file = download_audio(args.url, args.output, use_cookies=False, use_proxy=True)
-                else:
-                    raise
-        else:
-            # Принудительное использование опций
-            audio_file = download_audio(
-                args.url,
-                args.output,
-                use_cookies=args.cookies,
-                use_proxy=args.proxy
-            )
+    print(f"🎯 Цель: {args.url}\n")
 
-        print(f"\n✅ Аудио сохранено: {os.path.basename(audio_file)}")
+    # 🔑 Автоматическое отключение прокси для музыкальных клипов YouTube
+    if 'youtube.com' in args.url or 'youtu.be' in args.url:
+        if args.tor:
+            print("⚠️  ВНИМАНИЕ: для музыкальных клипов прокси часто вызывает ошибки")
+            print("   Рекомендуется запускать БЕЗ --tor\n")
+        else:
+            print("💡 Совет: для музыки прокси НЕ требуется (ваш регион имеет лицензию)\n")
+
+    start_time = time.time()
+    try:
+        audio_file = download_audio(
+            args.url,
+            args.output,
+            use_tor=args.tor,
+            debug=args.debug
+        )
+        elapsed = time.time() - start_time
+        print(f"\n✅ Успешно за {elapsed:.1f} сек | {os.path.basename(audio_file)}")
+        sys.exit(0)
 
     except Exception as e:
         print(f"\n❌ Ошибка: {str(e)}")
+
+        if 'format is not available' in str(e).lower():
+            print("\n💡 Ключевая причина ошибки с прокси:")
+            print("  YouTube блокирует музыкальные клипы при смене региона.")
+            print("  Tor меняет ваш IP на случайный узел (часто без лицензии на музыку).")
+            print("\n✅ Решение — скачивать музыку БЕЗ прокси:")
+            print(f"   python download-audio.py '{args.url}' -o {args.output}")
+            print("\n🔍 Проверка лицензии в вашем регионе:")
+            print("   Откройте видео в браузере БЕЗ прокси — если воспроизводится,")
+            print("   значит ваш регион имеет лицензию и прокси НЕ нужен.")
+
         sys.exit(1)
